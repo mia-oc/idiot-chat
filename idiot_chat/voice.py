@@ -1,4 +1,4 @@
-"""Optional bounded recording and macOS local speech. No microphone at import/startup."""
+"""Bounded live microphone buffering and macOS speech. No microphone at import/startup."""
 import io
 import shutil
 import subprocess
@@ -34,7 +34,7 @@ class Recorder:
         try:
             import sounddevice as sd
         except (ImportError, OSError):
-            raise VoiceError('Voice input is optional. Install idiot-chat[voice] and PortAudio '
+            raise VoiceError('Microphone support is missing. Install idiot-chat[voice] and PortAudio '
                              '(brew install portaudio), or keep using typed chat.') from None
         self._chunks = []
         self._frames = 0
@@ -51,7 +51,7 @@ class Recorder:
                 if status:
                     self.overflowed = True
                 if self._frames >= limit:
-                    raise sd.CallbackStop()
+                    pass  # Bound pending audio to 30 seconds until the next live turn.
 
         try:
             self.stream = sd.InputStream(samplerate=self.SAMPLE_RATE, channels=1,
@@ -63,6 +63,27 @@ class Recorder:
             raise VoiceError('Could not open the microphone. On macOS allow the launching terminal '
                              'or Python app in System Settings > Privacy & Security > Microphone, '
                              'then restart it. Check the default input device. Typed chat still works.') from None
+
+    def take(self):
+        """Drain a bounded live chunk without closing the input stream; ignore silence."""
+        from array import array
+        with self._lock:
+            data = b''.join(self._chunks)
+            self._chunks.clear()
+            self._frames = 0
+            overflowed, self.overflowed = self.overflowed, False
+        if overflowed:
+            raise VoiceError('The microphone dropped audio. Check the input device and restart Watch and Chat.')
+        samples = array('h', data)
+        if not samples or sum(v * v for v in samples) / len(samples) < 200 ** 2:
+            return None
+        output = io.BytesIO()
+        with wave.open(output, 'wb') as wav:
+            wav.setnchannels(1)
+            wav.setsampwidth(2)
+            wav.setframerate(self.SAMPLE_RATE)
+            wav.writeframes(data)
+        return output.getvalue()
 
     def finish(self):
         if self.stream is None:

@@ -6,7 +6,7 @@ import threading
 import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from unittest.mock import patch
+from unittest.mock import patch, Mock
 
 from idiot_chat.capture import CaptureError
 from idiot_chat.config import Config
@@ -46,6 +46,12 @@ class DesktopTests(unittest.TestCase):
         self.thread.start()
         self.root = tk.Tk()
         self.root.withdraw()
+        self.recorder_patch = patch('idiot_chat.app.Recorder')
+        self.recorder = self.recorder_patch.start().return_value
+        self.recorder.active = False
+        self.recorder.start.side_effect = lambda: setattr(self.recorder, 'active', True)
+        self.recorder.cancel.side_effect = lambda: setattr(self.recorder, 'active', False)
+        self.recorder.take.return_value = None
         self.app = App(self.root, Config(base_url='http://127.0.0.1:%s/v1' % self.server.server_port))
         image = io.BytesIO()
         Image.new('RGB', (8, 8), 'blue').save(image, format='PNG')
@@ -56,6 +62,7 @@ class DesktopTests(unittest.TestCase):
         self.release_request.set()
         self.app.close()
         self.capture_patch.stop()
+        self.recorder_patch.stop()
         self.server.shutdown()
         self.server.server_close()
         self.thread.join(timeout=2)
@@ -72,43 +79,41 @@ class DesktopTests(unittest.TestCase):
         self.root.deiconify()
         self.root.geometry('760x700')
         self.root.update()
-        for widget in (self.app.privacy_label, self.app.send_button, self.app.record_button):
+        for widget in (self.app.privacy_label, self.app.send_button, self.app.start_button, self.app.stop_button):
             self.assertTrue(widget.winfo_ismapped())
             self.assertLessEqual(widget.winfo_rooty() + widget.winfo_height(),
                                  self.root.winfo_rooty() + self.root.winfo_height())
         self.capture.assert_not_called()
         self.assertEqual(self.requests, [])
 
-    def test_explicit_start_screenshot_send_history_and_text_only(self):
-        self.app.question.insert('1.0', 'Describe this')
+    def test_watch_starts_screen_and_voice_then_repeats_and_stops(self):
         self.app.send()
         self.capture.assert_not_called()
-        self.assertEqual(self.requests, [])
+        self.recorder.start.assert_not_called()
         self.app.start()
-        self.capture.assert_not_called()
-        self.app.send()
         self.drain()
         self.capture.assert_called_once()
-        self.assertEqual(self.requests[0][0], '/v1/chat/completions')
+        self.recorder.start.assert_called_once()
         content = self.requests[0][1]['messages'][-1]['content']
         self.assertTrue(content[1]['image_url']['url'].startswith('data:image/png;base64,'))
-        self.assertEqual(self.app.history[-1], ('assistant', 'A local mock reply'))
-        self.app.screenshot.set(False)
-        self.app.question.insert('1.0', 'Follow-up')
-        self.app.send()
-        self.drain()
-        self.capture.assert_called_once()
-        self.assertEqual(len(self.requests[-1][1]['messages']), 4)
-        self.assertEqual(self.requests[-1][1]['messages'][-1]['content'], 'Follow-up')
+        self.recorder.take.return_value = b'synthetic wav'
+        self.root.after_cancel(self.app.watch_after)
+        with patch('idiot_chat.app.Client.transcribe', return_value='What is on my screen?') as transcribe:
+            self.app.watch_step()
+            self.drain()
+            transcribe.assert_called_once_with(b'synthetic wav')
+        self.assertIn('What is on my screen?', str(self.requests[-1]))
+        self.assertEqual(self.capture.call_count, 2)
         self.app.stop()
-        self.app.send()
-        self.assertEqual(len(self.requests), 2)
+        self.assertFalse(self.recorder.active)
+        self.assertIsNone(self.app.watch_after)
+        self.app.watch_step()
+        self.assertEqual(self.capture.call_count, 2)
 
     def test_stop_discards_pending_response(self):
         self.release_request.clear()
         self.app.start()
         self.app.question.insert('1.0', 'Pending question')
-        self.app.send()
         self.assertTrue(self.request_started.wait(3))
         self.app.stop()
         self.release_request.set()
@@ -121,23 +126,25 @@ class DesktopTests(unittest.TestCase):
         self.capture.side_effect = CaptureError('Screen Recording permission required')
         self.app.start()
         self.app.question.insert('1.0', 'My question')
-        self.app.send()
         self.drain()
         self.assertEqual(self.requests, [])
         self.assertIn('Screen Recording', self.app.status.get())
         self.assertEqual(self.app.question.get('1.0', 'end').strip(), 'My question')
 
-    def test_voice_unavailable_leaves_typed_chat_working(self):
+    def test_voice_unavailable_leaves_screen_chat_working(self):
+        self.recorder.start.side_effect = VoiceError('Microphone unavailable')
         self.app.start()
-        with patch.object(self.app.recorder, 'start', side_effect=VoiceError('Microphone unavailable')):
-            self.app.record()
-        self.assertFalse(self.app.recorder.active)
-        self.assertIn('Microphone unavailable', self.app.status.get())
-        self.app.screenshot.set(False)
-        self.app.question.insert('1.0', 'Typed fallback')
-        self.app.send()
         self.drain()
+        self.assertFalse(self.app.recorder.active)
         self.assertEqual(len(self.requests), 1)
+        self.assertTrue(self.app.session.active)
+
+    def test_missing_key_never_starts_capture(self):
+        self.app.settings['base_url'].set('https://api.openai.com/v1')
+        self.app.start()
+        self.capture.assert_not_called()
+        self.recorder.start.assert_not_called()
+        self.assertFalse(self.app.session.active)
 
 
 if __name__ == '__main__':

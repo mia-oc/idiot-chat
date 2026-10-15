@@ -1,9 +1,7 @@
 """Native Tk desktop UI. All widget access stays on the main thread."""
 import queue
 import threading
-import time
 from dataclasses import replace
-from datetime import datetime
 
 from .api import APIError, Client, build_messages
 from .capture import CaptureError, capture_screen
@@ -32,6 +30,7 @@ class App:
         self.indexing = False
         self.closed = False
         self.history = []
+        self.watch_after = None
         self.snapshot = None
         self.settings = {}
         self.status = tk.StringVar(value='Stopped. No screen capture or microphone activity.')
@@ -46,7 +45,7 @@ class App:
         footer = ttk.Frame(outer)
         footer.pack(side='bottom', fill='x')
         ttk.Label(outer, text='Idiot Chat', font=('Helvetica', 20, 'bold')).pack(anchor='w')
-        ttk.Label(outer, text='Start a session, then ask. Capture happens only when you press Send.').pack(anchor='w')
+        ttk.Label(outer, text='Watch and Chat shares your screen and microphone until you press Stop.').pack(anchor='w')
         settings = ttk.LabelFrame(outer, text='API settings (memory only; editable while stopped)', padding=8)
         settings.pack(fill='x', pady=(8, 6))
         self.settings_entries = []
@@ -64,9 +63,10 @@ class App:
         settings.columnconfigure(1, weight=1)
         controls = ttk.Frame(outer)
         controls.pack(fill='x', pady=4)
-        self.start_button = ttk.Button(controls, text='Start session', command=self.start)
+        ttk.Style(root).configure('Watch.TButton', font=('Helvetica', 12, 'bold'), padding=8)
+        self.start_button = ttk.Button(controls, text='Watch and Chat', command=self.start, style='Watch.TButton')
         self.start_button.pack(side='left')
-        self.stop_button = ttk.Button(controls, text='Stop session', command=self.stop)
+        self.stop_button = ttk.Button(controls, text='Stop', command=self.stop)
         self.stop_button.pack(side='left', padx=5)
         self.clear_button = ttk.Button(controls, text='Clear chat', command=self.clear)
         self.clear_button.pack(side='left')
@@ -74,7 +74,7 @@ class App:
         ttk.Label(outer, textvariable=self.capture_status, wraplength=930).pack(anchor='w')
         attach = ttk.Frame(outer)
         attach.pack(fill='x', pady=5)
-        ttk.Checkbutton(attach, text='Attach screenshot on Send (whole desktop)', variable=self.screenshot).pack(side='left')
+        ttk.Checkbutton(attach, text='Include screen in typed messages', variable=self.screenshot).pack(side='left')
         ttk.Checkbutton(attach, text='Attach selected folder text', variable=self.use_context).pack(side='left', padx=8)
         folder = ttk.Frame(outer)
         folder.pack(fill='x')
@@ -96,10 +96,6 @@ class App:
         actions.pack(fill='x', pady=6)
         self.send_button = ttk.Button(actions, text='Send', command=self.send)
         self.send_button.pack(side='left')
-        self.record_button = ttk.Button(actions, text='Record voice (max 30s)', command=self.record)
-        self.record_button.pack(side='left', padx=6)
-        self.cancel_record_button = ttk.Button(actions, text='Discard recording', command=self.cancel_recording)
-        self.cancel_record_button.pack(side='left')
         self.speech_check = ttk.Checkbutton(actions, text='Speak replies (macOS)', variable=self.speak_replies)
         self.speech_check.pack(side='left', padx=8)
         ttk.Button(actions, text='Mute', command=self.mute).pack(side='left')
@@ -108,7 +104,7 @@ class App:
         self.privacy_label = ttk.Label(footer, text=(
             'Privacy: Send transmits your question, recent chat, and the attachments you enable to the API above. '
             'Screenshots may include private windows. Folder exclusions are not secret detection: review the text. '
-            'Voice recording starts only when clicked; Transcribe sends audio to that API. Chat is not saved. '
+            'Watch and Chat automatically sends screen frames and microphone speech until Stop. Chat is not saved. '
             'OS capture may use a temporary file. Providers may retain data or charge. Stop cannot recall a sent request.'
         ), wraplength=930, foreground='#555555')
         self.privacy_label.pack(anchor='w', pady=(2, 0))
@@ -132,13 +128,10 @@ class App:
 
     def refresh(self):
         active = self.session.active
-        idle = active and not self.busy and not self.indexing and not self.recorder.active
+        idle = active and not self.busy and not self.indexing
         self.start_button.configure(state='disabled' if active or self.busy else 'normal')
         self.stop_button.configure(state='normal' if active else 'disabled')
         self.send_button.configure(state='normal' if idle else 'disabled')
-        self.record_button.configure(state='normal' if active and not self.busy and not self.indexing else 'disabled')
-        self.record_button.configure(text='Finish & transcribe' if self.recorder.active else 'Record voice (max 30s)')
-        self.cancel_record_button.configure(state='normal' if self.recorder.active else 'disabled')
         self.clear_button.configure(state='disabled' if self.busy else 'normal')
         for button in (self.folder_button, self.remove_folder_button):
             button.configure(state='disabled' if self.busy or self.indexing or self.recorder.active else 'normal')
@@ -154,13 +147,57 @@ class App:
         except ValueError as error:
             self.notice(str(error))
             return
+        if self.config.base_url.rstrip('/') == 'https://api.openai.com/v1' and not self.config.api_key:
+            self.notice('Enter an API key before Watch and Chat, or configure a local API URL.')
+            return
         self.session.start()
-        self.status.set('Session started. No capture or microphone activity until you act.')
-        self.capture_status.set('Capture: idle. A screenshot is taken only on Send if enabled.')
+        try:
+            self.recorder.start()
+        except VoiceError as error:
+            self.notice(str(error) + ' Screen chat remains available.')
+            self.capture_status.set('Microphone unavailable. Screen chat only.')
         self.refresh()
+        self.watch_step(initial=True)
         self.question.focus_set()
 
+    def watch_step(self, initial=False):
+        self.watch_after = None
+        if not self.session.active or self.closed:
+            return
+        if not self.busy and not self.indexing:
+            token = self.session.token()
+            config, history = self.config, list(self.history)
+            context = self.snapshot.text if self.use_context.get() and self.snapshot else ''
+            try:
+                audio = self.recorder.take() if self.recorder.active else None
+            except VoiceError as error:
+                self.stop()
+                self.notice(str(error))
+                return
+            self.status.set('WATCHING' + (' + MICROPHONE LIVE' if self.recorder.active else ' (microphone unavailable)') +
+                            '. Sending screen context; Stop ends capture.')
+            self.capture_status.set('Screen: live, refreshed every 5 seconds when the API is ready.')
+
+            def work():
+                if token.is_set():
+                    return None
+                frame = capture_screen()
+                if token.is_set():
+                    return None
+                question = Client(config).transcribe(audio) if audio else ''
+                if token.is_set():
+                    return None
+                question = question.strip() or ('I have started Watch and Chat. Briefly describe what you see and ask how you can help.'
+                                                if initial else 'Screen update. Briefly mention meaningful changes or say you are ready to help.')
+                reply = Client(config).chat(build_messages(question, history, frame, context)) if not token.is_set() else None
+                return ('chat', question, reply) if reply is not None else None
+            self.launch(token, work)
+        self.watch_after = self.root.after(5000, self.watch_step)
+
     def stop(self):
+        if self.watch_after is not None:
+            self.root.after_cancel(self.watch_after)
+            self.watch_after = None
         self.session.stop()
         self.recorder.cancel()
         self.speaker.stop()
@@ -232,7 +269,7 @@ class App:
         threading.Thread(target=run, daemon=True).start()
 
     def send(self, event=None):
-        if not self.session.active or self.busy or self.indexing or self.recorder.active:
+        if not self.session.active or self.busy or self.indexing:
             return 'break'
         question = self.question.get('1.0', 'end').strip()
         if not question or len(question) > 12000:
@@ -256,7 +293,6 @@ class App:
             screenshot = capture_screen() if capture else None
             if token.is_set():
                 return None
-            self.events.put(('capture', token, bool(capture)))
             messages = build_messages(question, history, screenshot, context)
             if token.is_set():
                 return None
@@ -264,44 +300,6 @@ class App:
             return ('chat', question, reply)
         self.launch(token, work)
         return 'break'
-
-    def record(self):
-        if not self.session.active or self.busy or self.indexing:
-            return
-        if self.recorder.active:
-            self.finish_recording()
-            return
-        self.speaker.stop()
-        try:
-            self.recorder.start()
-            self.status.set('MICROPHONE RECORDING. Finish & transcribe sends audio; Discard or Stop deletes it.')
-        except VoiceError as error:
-            self.notice(str(error))
-        self.refresh()
-
-    def cancel_recording(self):
-        self.recorder.cancel()
-        self.status.set('Recording discarded. Microphone off. Nothing sent.')
-        self.refresh()
-
-    def finish_recording(self):
-        try:
-            wav_bytes = self.recorder.finish()
-            token = self.session.token()
-        except (VoiceError, RuntimeError, OSError) as error:
-            self.recorder.cancel()
-            self.notice(str(error) if isinstance(error, VoiceError) else
-                        'Could not finish recording. Audio discarded; microphone off. Retry or use typed chat.')
-            self.refresh()
-            return
-        config = self.config
-        self.status.set('Microphone off. Sending recorded audio for transcription. Review text before Send.')
-
-        def work():
-            if token.is_set():
-                return None
-            return ('voice', Client(config).transcribe(wav_bytes))
-        self.launch(token, work)
 
     def mute(self):
         self.speak_replies.set(False)
@@ -328,18 +326,13 @@ class App:
                         len(snapshot.files), len(snapshot.text), snapshot.skipped,
                         '; LIMITED / TRUNCATED' if snapshot.truncated else ''))
                 self.refresh()
-            elif kind == 'capture' and self.session.current(event[1]):
-                self.capture_status.set('Capture: one screenshot captured at %s. No more until Send.' %
-                                        datetime.now().strftime('%H:%M:%S') if event[2]
-                                        else 'Capture: disabled for this message.')
-                self.status.set('Waiting for API response. No background capture or microphone activity.')
             elif kind == 'done':
                 self.busy = False
                 token, value, error = event[1:]
                 if self.session.current(token):
                     if error:
-                        self.notice(error + ' Your draft is unchanged.')
-                        self.capture_status.set('Capture: idle after error. No automatic retry.')
+                        self.stop()
+                        self.notice(error + ' Capture stopped. Fix the issue, then press Watch and Chat.')
                     elif value is not None and value[0] == 'chat':
                         _, question, reply = value
                         self.history.extend([('user', question), ('assistant', reply)])
@@ -349,34 +342,21 @@ class App:
                         # Preserve edits typed while the request was in flight.
                         if self.question.get('1.0', 'end').strip() == question:
                             self.question.delete('1.0', 'end')
-                        self.status.set('Reply received. Idle; nothing is being captured or recorded.')
+                        self.status.set('WATCHING' + (' + MICROPHONE LIVE' if self.recorder.active else ' (microphone unavailable)') + '. Stop ends capture.')
                         if self.speak_replies.get():
                             try:
                                 self.speaker.speak(reply)
                             except VoiceError as voice_error:
                                 self.notice(str(voice_error))
-                    elif value is not None and value[0] == 'voice':
-                        self.question.insert('end-1c', ('\n' if self.question.get('1.0', 'end').strip() else '') + value[1])
-                        self.status.set('Transcription added to draft. Review it, then Send. Microphone off.')
                 else:
                     self.status.set('Stopped. Pending result discarded. No capture or microphone activity.')
                 self.refresh()
-        if self.recorder.active:
-            elapsed = time.monotonic() - self.recorder.started_at
-            self.status.set('MICROPHONE RECORDING %ss / 30s. Finish & transcribe sends audio; Discard deletes it.' % int(elapsed))
-            if elapsed >= self.recorder.MAX_SECONDS:
-                # A hard limit ends recording; never upload without Finish & transcribe.
-                self.cancel_recording()
-                self.notice('30-second recording limit reached. Audio discarded, microphone off. '
-                            'Record a shorter question and click Finish & transcribe to upload.')
         self.poll_after = self.root.after(80, self.poll)
 
     def close(self):
         self.closed = True
         self.root.after_cancel(self.poll_after)
-        self.session.stop()
-        self.recorder.cancel()
-        self.speaker.stop()
+        self.stop()
         self.history.clear()
         self.snapshot = None
         for variable in self.settings.values():

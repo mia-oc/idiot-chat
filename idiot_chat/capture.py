@@ -1,4 +1,4 @@
-"""Single-shot capture, called only by an explicit Send action."""
+"""Single-shot capture, called only during an explicitly activated session."""
 import io
 import sys
 
@@ -11,7 +11,7 @@ PERMISSION_GUIDE = (
     'Screen capture failed. On macOS, open System Settings > Privacy & Security > '
     'Screen & System Audio Recording (Screen Recording on older versions). '
     'Allow the terminal or Python application used to launch Idiot Chat, then quit '
-    'and reopen it. You can untick Attach screenshot and continue with typed chat.'
+    'and reopen it. Fix permissions and restart Watch and Chat.'
 )
 
 
