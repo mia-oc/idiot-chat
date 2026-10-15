@@ -5,10 +5,10 @@ from dataclasses import replace
 
 from .api import APIError, Client, build_messages
 from .capture import CaptureError, capture_screen
-from .config import Config
+from .config import Config, load_voice, save_voice
 from .context import index_folder
 from .session import Session
-from .voice import Recorder, Speaker, VoiceError
+from .voice import Recorder, Speaker, VoiceError, VOICES
 
 
 class App:
@@ -38,7 +38,8 @@ class App:
         self.folder_status = tk.StringVar(value='No folder selected. Nothing indexed or attached.')
         self.screenshot = tk.BooleanVar(value=True)
         self.use_context = tk.BooleanVar(value=False)
-        self.speak_replies = tk.BooleanVar(value=False)
+        self.speak_replies = tk.BooleanVar(value=True)
+        self.voice = tk.StringVar(value=load_voice())
         outer = ttk.Frame(root, padding=12)
         outer.pack(fill='both', expand=True)
         # Reserve the composer/privacy area before allocating flexible transcript space.
@@ -60,6 +61,10 @@ class App:
             entry = ttk.Entry(settings, textvariable=variable, show='•' if key == 'api_key' else '')
             entry.grid(row=row, column=1, sticky='ew', pady=2)
             self.settings_entries.append(entry)
+        ttk.Label(settings, text='Edge TTS voice').grid(row=4, column=0, sticky='w')
+        voices = ttk.Combobox(settings, textvariable=self.voice, values=VOICES)
+        voices.grid(row=4, column=1, sticky='ew')
+        self.settings_entries.append(voices)
         settings.columnconfigure(1, weight=1)
         controls = ttk.Frame(outer)
         controls.pack(fill='x', pady=4)
@@ -96,7 +101,7 @@ class App:
         actions.pack(fill='x', pady=6)
         self.send_button = ttk.Button(actions, text='Send', command=self.send)
         self.send_button.pack(side='left')
-        self.speech_check = ttk.Checkbutton(actions, text='Speak replies (macOS)', variable=self.speak_replies)
+        self.speech_check = ttk.Checkbutton(actions, text='Speak replies (Edge TTS)', variable=self.speak_replies)
         self.speech_check.pack(side='left', padx=8)
         ttk.Button(actions, text='Mute', command=self.mute).pack(side='left')
         if not self.speaker.available:
@@ -150,59 +155,92 @@ class App:
         if self.config.base_url.rstrip('/') == 'https://api.openai.com/v1' and not self.config.api_key:
             self.notice('Enter an API key before Watch and Chat, or configure a local API URL.')
             return
+        try:
+            save_voice(self.voice.get().strip())
+        except OSError:
+            self.notice('Could not save voice preference. This session can still use it.')
         self.session.start()
+        self.status.set('Listening… Speak naturally; Stop ends the session.')
+        self.capture_status.set('Screen: ready. Captured automatically with each spoken turn.')
+        self.append('Idiot Chat', 'What do you need help with?')
+        self.speak('What do you need help with?')
+        # Opening the input is quick; synthesis, transcription and model calls are workers.
         try:
             self.recorder.start()
         except VoiceError as error:
-            self.notice(str(error) + ' Screen chat remains available.')
-            self.capture_status.set('Microphone unavailable. Screen chat only.')
+            self.notice(str(error) + ' Typed screen chat remains available.')
         self.refresh()
-        self.watch_step(initial=True)
+        self.watch_step()
         self.question.focus_set()
+
+    def speak(self, text):
+        if not self.speak_replies.get() or not self.session.active:
+            return
+        token, voice = self.session.token(), self.voice.get()
+        def work():
+            try:
+                self.speaker.speak(text, voice, token)
+            except Exception as error:
+                message = str(error) if isinstance(error, VoiceError) else 'Speech failed. Replies remain visible.'
+                self.events.put(('speech_error', token, message))
+        threading.Thread(target=work, daemon=True).start()
+
+    def interrupt(self):
+        """Invalidate this turn before cancelling audio. Old workers can never publish."""
+        self.session.start()
+        self.speaker.stop()
+        self.busy = False
+        self.status.set('Listening…')
+        self.refresh()
 
     def watch_step(self, initial=False):
         self.watch_after = None
         if not self.session.active or self.closed:
             return
-        if not self.busy and not self.indexing:
-            token = self.session.token()
-            config, history = self.config, list(self.history)
-            context = self.snapshot.text if self.use_context.get() and self.snapshot else ''
-            try:
-                audio = self.recorder.take() if self.recorder.active else None
-            except VoiceError as error:
-                self.stop()
-                self.notice(str(error))
-                return
-            self.status.set('WATCHING' + (' + MICROPHONE LIVE' if self.recorder.active else ' (microphone unavailable)') +
-                            '. Sending screen context; Stop ends capture.')
-            self.capture_status.set('Screen: live, refreshed every 5 seconds when the API is ready.')
+        if self.recorder.active:
+            if self.recorder.speech_started.is_set():
+                self.recorder.speech_started.clear()
+                self.interrupt()
+            if self.recorder.ready() and not self.busy and not self.indexing:
+                try:
+                    audio = self.recorder.take()
+                except VoiceError as error:
+                    self.stop()
+                    self.notice(str(error))
+                    return
+                if audio:
+                    self.voice_turn(audio)
+        self.watch_after = self.root.after(60, self.watch_step)
 
-            def work():
-                if token.is_set():
-                    return None
-                frame = capture_screen()
-                if token.is_set():
-                    return None
-                question = Client(config).transcribe(audio) if audio else ''
-                if token.is_set():
-                    return None
-                question = question.strip() or ('I have started Watch and Chat. Briefly describe what you see and ask how you can help.'
-                                                if initial else 'Screen update. Briefly mention meaningful changes or say you are ready to help.')
-                reply = Client(config).chat(build_messages(question, history, frame, context)) if not token.is_set() else None
-                return ('chat', question, reply) if reply is not None else None
-            self.launch(token, work)
-        self.watch_after = self.root.after(5000, self.watch_step)
+    def voice_turn(self, audio):
+        token, config, history = self.session.token(), self.config, list(self.history)
+        context = self.snapshot.text if self.use_context.get() and self.snapshot else ''
+        self.status.set('Understanding your question… You can interrupt by speaking.')
+        self.capture_status.set('Screen: captured automatically for each spoken turn.')
+        def work():
+            if token.is_set():
+                return None
+            frame = capture_screen()
+            if token.is_set():
+                return None
+            question = Client(config).transcribe(audio).strip()
+            if token.is_set() or not question:
+                return None
+            reply = Client(config).chat(build_messages(question, history, frame, context))
+            return ('chat', question, reply)
+        self.launch(token, work)
 
     def stop(self):
         if self.watch_after is not None:
             self.root.after_cancel(self.watch_after)
             self.watch_after = None
+        was_busy = self.busy
         self.session.stop()
+        self.busy = False
         self.recorder.cancel()
         self.speaker.stop()
         self.status.set('Stopped. Pending results discarded; an already-sent request cannot be recalled.'
-                        if self.busy else 'Stopped. No screen capture or microphone activity.')
+                        if was_busy else 'Stopped. No screen capture or microphone activity.')
         self.capture_status.set('Capture: stopped. No further captures scheduled.')
         self.refresh()
 
@@ -278,6 +316,7 @@ class App:
         if self.use_context.get() and self.snapshot is None:
             self.notice('Choose and review a folder first, or untick folder context.')
             return 'break'
+        self.interrupt()
         token = self.session.token()
         config = self.config
         history = list(self.history)
@@ -326,10 +365,13 @@ class App:
                         len(snapshot.files), len(snapshot.text), snapshot.skipped,
                         '; LIMITED / TRUNCATED' if snapshot.truncated else ''))
                 self.refresh()
+            elif kind == 'speech_error':
+                if self.session.current(event[1]):
+                    self.notice(event[2])
             elif kind == 'done':
-                self.busy = False
                 token, value, error = event[1:]
                 if self.session.current(token):
+                    self.busy = False
                     if error:
                         self.stop()
                         self.notice(error + ' Capture stopped. Fix the issue, then press Watch and Chat.')
@@ -345,10 +387,10 @@ class App:
                         self.status.set('WATCHING' + (' + MICROPHONE LIVE' if self.recorder.active else ' (microphone unavailable)') + '. Stop ends capture.')
                         if self.speak_replies.get():
                             try:
-                                self.speaker.speak(reply)
+                                self.speak(reply)
                             except VoiceError as voice_error:
                                 self.notice(str(voice_error))
-                else:
+                elif not self.session.active:
                     self.status.set('Stopped. Pending result discarded. No capture or microphone activity.')
                 self.refresh()
         self.poll_after = self.root.after(80, self.poll)

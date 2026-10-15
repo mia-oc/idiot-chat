@@ -1,5 +1,7 @@
 """Bounded live microphone buffering and macOS speech. No microphone at import/startup."""
 import io
+import tempfile
+from pathlib import Path
 import shutil
 import subprocess
 import sys
@@ -23,6 +25,9 @@ class Recorder:
         self._lock = threading.Lock()
         self.started_at = 0.0
         self.overflowed = False
+        self.speech_started = threading.Event()
+        self.speech_active = False
+        self.last_voice = 0.0
 
     @property
     def active(self):
@@ -38,10 +43,23 @@ class Recorder:
                              '(brew install portaudio), or keep using typed chat.') from None
         self._chunks = []
         self._frames = 0
+        self.speech_active = False
+        self.speech_started.clear()
         self.overflowed = False
         limit = self.SAMPLE_RATE * self.MAX_SECONDS
 
         def callback(indata, frames, timing, status):
+            from array import array
+            samples = array('h', bytes(indata))
+            loud = bool(samples) and sum(v*v for v in samples) / len(samples) > 500 ** 2
+            now = time.monotonic()
+            if loud:
+                if not self.speech_active:
+                    self.speech_active = True
+                    self.speech_started.set()
+                self.last_voice = now
+            if not self.speech_active:
+                return
             with self._lock:
                 remaining = limit - self._frames
                 take = min(frames, max(0, remaining))
@@ -64,8 +82,13 @@ class Recorder:
                              'or Python app in System Settings > Privacy & Security > Microphone, '
                              'then restart it. Check the default input device. Typed chat still works.') from None
 
+    def ready(self):
+        return self.speech_active and (time.monotonic() - self.last_voice > 0.7 or
+                                      self._frames >= self.SAMPLE_RATE * self.MAX_SECONDS)
+
     def take(self):
         """Drain a bounded live chunk without closing the input stream; ignore silence."""
+        self.speech_active = False
         from array import array
         with self._lock:
             data = b''.join(self._chunks)
@@ -121,35 +144,59 @@ class Recorder:
             self._chunks.clear()
 
 
+DEFAULT_VOICE = 'en-GB-SoniaNeural'
+VOICES = (DEFAULT_VOICE, 'en-GB-RyanNeural', 'en-US-JennyNeural', 'en-US-GuyNeural')
+
+
 class Speaker:
+    """Replaceable speak(text, voice, cancel)/stop provider. No Tk calls here."""
     def __init__(self):
         self.process = None
+        self._lock = threading.Lock()
 
     @property
     def available(self):
-        return sys.platform == 'darwin' and shutil.which('say') is not None
+        return True  # Missing dependencies produce a useful text-only error at invocation.
 
-    def speak(self, text):
-        self.stop()
-        if not self.available:
-            raise VoiceError('Speech output needs macOS /usr/bin/say. Replies remain visible as text.')
+    def _run(self, command, cancel):
+        with self._lock:
+            if cancel.is_set():
+                return False
+            process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self.process = process
         try:
-            # Use stdin rather than shell interpolation or command-line speech text.
-            self.process = subprocess.Popen(['/usr/bin/say', '-f', '-'], stdin=subprocess.PIPE,
-                                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            self.process.communicate(text[:12000].encode('utf-8'), timeout=0.05)
-        except subprocess.TimeoutExpired:
-            pass  # say continues speaking; Stop or Mute terminates it.
+            while process.poll() is None:
+                if cancel.wait(0.03):
+                    process.terminate()
+                    try:
+                        process.wait(timeout=0.5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                    return False
+            if process.returncode and not cancel.is_set():
+                raise VoiceError('Edge speech failed. Check internet access and install idiot-chat[voice]. Replies remain visible.')
+            return not cancel.is_set()
+        finally:
+            process.wait()
+            with self._lock:
+                if self.process is process:
+                    self.process = None
+
+    def speak(self, text, voice=DEFAULT_VOICE, cancel=None):
+        cancel = cancel or threading.Event()
+        player = ['/usr/bin/afplay'] if sys.platform == 'darwin' else ([shutil.which('ffplay'), '-nodisp', '-autoexit'] if shutil.which('ffplay') else None)
+        if player is None:
+            raise VoiceError('Install ffplay for speech playback on this platform. Replies remain visible.')
+        try:
+            with tempfile.TemporaryDirectory(prefix='idiot-chat-tts-') as directory:
+                output = str(Path(directory) / 'speech.mp3')
+                if self._run([sys.executable, '-m', 'edge_tts', '--voice', voice,
+                              '--text', text[:12000], '--write-media', output], cancel):
+                    self._run(player + [output], cancel)
         except OSError:
-            raise VoiceError('Speech playback could not start. Replies remain visible as text.') from None
+            raise VoiceError('Speech playback could not start. Replies remain visible.') from None
 
     def stop(self):
-        if self.process is not None:
-            if self.process.poll() is None:
+        with self._lock:
+            if self.process is not None and self.process.poll() is None:
                 self.process.terminate()
-            try:
-                self.process.wait(timeout=0.5)
-            except subprocess.TimeoutExpired:
-                self.process.kill()
-                self.process.wait(timeout=0.5)
-            self.process = None

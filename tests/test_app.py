@@ -52,9 +52,17 @@ class DesktopTests(unittest.TestCase):
         self.recorder.start.side_effect = lambda: setattr(self.recorder, 'active', True)
         self.recorder.cancel.side_effect = lambda: setattr(self.recorder, 'active', False)
         self.recorder.take.return_value = None
+        self.recorder.ready.return_value = False
+        self.recorder.speech_started = threading.Event()
+        self.speaker_patch = patch('idiot_chat.app.Speaker')
+        self.speaker_patch.start()
+        self.save_patch = patch('idiot_chat.app.save_voice')
+        self.save_patch.start()
         self.app = App(self.root, Config(base_url='http://127.0.0.1:%s/v1' % self.server.server_port))
         image = io.BytesIO()
         Image.new('RGB', (8, 8), 'blue').save(image, format='PNG')
+        self.transcribe_patch = patch('idiot_chat.app.Client.transcribe', return_value='spoken question')
+        self.transcribe_patch.start()
         self.capture_patch = patch('idiot_chat.app.capture_screen', return_value=image.getvalue())
         self.capture = self.capture_patch.start()
 
@@ -62,7 +70,10 @@ class DesktopTests(unittest.TestCase):
         self.release_request.set()
         self.app.close()
         self.capture_patch.stop()
+        self.transcribe_patch.stop()
         self.recorder_patch.stop()
+        self.speaker_patch.stop()
+        self.save_patch.stop()
         self.server.shutdown()
         self.server.server_close()
         self.thread.join(timeout=2)
@@ -91,12 +102,14 @@ class DesktopTests(unittest.TestCase):
         self.capture.assert_not_called()
         self.recorder.start.assert_not_called()
         self.app.start()
+        self.app.voice_turn(b'synthetic wav')
         self.drain()
         self.capture.assert_called_once()
         self.recorder.start.assert_called_once()
         content = self.requests[0][1]['messages'][-1]['content']
         self.assertTrue(content[1]['image_url']['url'].startswith('data:image/png;base64,'))
         self.recorder.take.return_value = b'synthetic wav'
+        self.recorder.ready.return_value = True
         self.root.after_cancel(self.app.watch_after)
         with patch('idiot_chat.app.Client.transcribe', return_value='What is on my screen?') as transcribe:
             self.app.watch_step()
@@ -113,6 +126,7 @@ class DesktopTests(unittest.TestCase):
     def test_stop_discards_pending_response(self):
         self.release_request.clear()
         self.app.start()
+        self.app.voice_turn(b'wav')
         self.app.question.insert('1.0', 'Pending question')
         self.assertTrue(self.request_started.wait(3))
         self.app.stop()
@@ -125,6 +139,7 @@ class DesktopTests(unittest.TestCase):
     def test_capture_error_sends_nothing_and_preserves_draft(self):
         self.capture.side_effect = CaptureError('Screen Recording permission required')
         self.app.start()
+        self.app.voice_turn(b'wav')
         self.app.question.insert('1.0', 'My question')
         self.drain()
         self.assertEqual(self.requests, [])
@@ -136,7 +151,7 @@ class DesktopTests(unittest.TestCase):
         self.app.start()
         self.drain()
         self.assertFalse(self.app.recorder.active)
-        self.assertEqual(len(self.requests), 1)
+        self.assertEqual(len(self.requests), 0)
         self.assertTrue(self.app.session.active)
 
     def test_missing_key_never_starts_capture(self):

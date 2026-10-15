@@ -24,13 +24,19 @@ brew install portaudio
 python -m pip install -e '.[voice]'
 ```
 
-Watch and Chat opens the default microphone through `sounddevice`. Every five seconds, when the previous API turn has finished, it drains the audio buffer, transcribes non-silent audio and sends that text with a fresh screenshot to the chat model. The buffer holds at most 30 seconds; audio beyond that is dropped during slow requests. Silence is filtered with a simple volume threshold, not speech recognition. Speech crossing chunk boundaries may be split. This is turn-based live chat, not a low-latency realtime audio API. Missing microphone support leaves screen and typed chat usable; the status explicitly indicates this.
+Watch and Chat opens the default microphone and immediately speaks “What do you need help with?”. Answer naturally. A local volume detector identifies speech onset and approximately 700 ms of trailing silence; each completed utterance is transcribed and sent with a fresh screenshot. There are no repeated screen-only requests during silence. Input is bounded to 30 seconds per turn. Speak again to interrupt synthesis/playback and invalidate an outstanding reply, without pressing anything. Use headphones: there is no acoustic echo cancellation, so loudspeaker output can trigger barge-in. Quiet speech or noisy rooms may need input-level adjustment.
 
-Optional speech output uses macOS's local `/usr/bin/say` with installed system voices. Tick **Speak replies** to enable it. **Mute**, Stop and closing the window stop playback. It is disabled on other operating systems. No separate TTS API or key is needed.
+This is turn-based transcription, not true streaming audio or streaming model output. Speech onset is checked every 60 ms, independently of model workers. HTTP requests already sent cannot be recalled: they finish in background, but cancelled turns cannot publish text or start playback. Stop closes the microphone and stops future screenshots and speech. Restart does not wait for an old HTTP timeout.
+
+### Edge TTS and voices
+
+The `voice` extra installs `edge-tts`, `sounddevice` and NumPy. Edge TTS uses an online Microsoft service without an API key; it requires internet access and sends reply text to that service. Availability and service terms can change. macOS playback uses `/usr/bin/afplay`; Linux/Windows require `ffplay` on PATH (install FFmpeg). Synthesis and playback run off the Tk thread, and cancellation terminates their subprocesses. Temporary MP3 files are removed when the speech worker exits.
+
+**Edge TTS voice** defaults to `en-GB-SoniaNeural`. Select a suggested UK/US voice or type another installed service voice name. To discover the full online catalogue run `python -m edge_tts --list-voices`. The preference is saved when you start, in `~/.config/idiot-chat/settings.json` (override with `IDIOT_CHAT_SETTINGS`). Only the voice is persisted, never the API key. **Speak replies** is on by default; **Mute** disables it for the current app instance. TTS errors leave visible replies intact and show a status notice. The replaceable provider interface is `Speaker.speak(text, voice, cancel_event)` plus `stop()` in `voice.py`.
 
 ## Configure
 
-Enter the API base URL, chat/vision model and API key in the window **while stopped**, then click **Watch and Chat**. The key is masked; settings are held in memory and never written to a configuration file. A key can be empty for a local server that does not require authentication. The base URL must include any provider prefix, such as `/v1`; do not include `/chat/completions`.
+Enter the API base URL, chat/vision model and API key in the window **while stopped**, then click **Watch and Chat**. The key is masked; API settings are held in memory and never written to a configuration file. A key can be empty for a local server that does not require authentication. The base URL must include any provider prefix, such as `/v1`; do not include `/chat/completions`.
 
 You can also set environment variables before launching:
 
@@ -56,11 +62,11 @@ Use the masked field for keys to avoid putting them in shell history. The app do
 ## Use
 
 1. Install with `python -m pip install -e '.[voice]'`, configure the API and optionally choose, review and enable a folder.
-2. Press **Watch and Chat**. The microphone opens and an initial screenshot is immediately sent to the vision model. No separate session assembly or Send action is required.
-3. Speak naturally or type and press **Send**. Live turns refresh the screen every five seconds when the API is ready; requests never overlap. Audio is sent to the transcription endpoint, then the resulting text and screen frame go to the chat endpoint. Screen-only updates also reach the model during silence.
-4. Press **Stop** to close the microphone, cancel future captures, discard buffered audio and suppress pending replies. Closing the window does the same. Stop cannot recall already-sent data or interrupt an OS screenshot call already in progress. Restart is available after an outstanding request finishes or times out.
+2. Press **Watch and Chat** once. Hear the welcome and answer by speaking. Screen capture happens automatically on each spoken turn, not before activation or continuously during silence.
+3. Read replies in the transcript or hear them spoken. Speak over a reply to interrupt it. Typed questions and optional folder context remain available.
+4. Press **Stop** or close the window to release input and cancel speech. Late replies are suppressed. Already-sent requests and an OS screenshot already in progress cannot be recalled.
 
-Live capture always includes the desktop. **Include screen in typed messages** controls typed messages only. API or capture errors stop the live session with useful guidance and preserve your draft. The default OpenAI endpoint requires a key before any device starts. Local APIs may omit a key. Replies are text by default; optional macOS speech playback may feed back into the microphone, so use headphones.
+Voice turns always include a desktop frame. **Include screen in typed messages** controls typed messages only. API/capture errors stop the session with guidance; missing microphone support leaves typed chat available. The default OpenAI endpoint requires a key before devices open.
 
 ### Folder context
 
@@ -80,11 +86,11 @@ The capture backend is Pillow's OS screenshot implementation. It captures a whol
 
 ## Privacy and limitations
 
-Chat, settings, folder snapshots, resized screenshots and microphone recordings are not deliberately persisted by the app. Closing it drops its in-memory state. macOS capture may use a temporary file as described above; operating-system swap/crash files and provider retention are outside the app's control. The API receives your question, up to 20 recent complete chat pairs within a 16,000-character history budget, and the current attachments you enable. Old screenshots and folder attachments are not replayed in conversation history. A transcription request sends recorded audio to the same configured API root. Your provider may retain data or charge for requests, including requests stopped locally.
+Chat, API settings, folder snapshots, resized screenshots and microphone recordings are not deliberately persisted by the app. Closing it drops its in-memory state. macOS capture may use a temporary file as described above; operating-system swap/crash files and provider retention are outside the app's control. The API receives your question, up to 20 recent complete chat pairs within a 16,000-character history budget, and the current attachments you enable. Old screenshots and folder attachments are not replayed in conversation history. A transcription request sends recorded audio to the same configured API root. Your provider may retain data or charge for requests, including requests stopped locally.
 
-This is a first MVP, not a signed/notarised macOS `.app`. It has no accounts, keychain integration, durable history, streaming replies, tool execution or desktop control. It cannot click or type into other applications. It only sees periodic desktop frames during an activated session, not a continuous video stream. Screenshot and folder content are labelled as untrusted reference data, but prompt-injection resistance cannot be guaranteed.
+This is a first MVP, not a signed/notarised macOS `.app`. It has no accounts, keychain integration, durable history, streaming replies, tool execution or desktop control. It cannot click or type into other applications. It only sees per-turn desktop frames during an activated session, not a continuous video stream. Screenshot and folder content are labelled as untrusted reference data, but prompt-injection resistance cannot be guaranteed.
 
-Compatibility targets the `/chat/completions` JSON schema with `max_tokens`, bearer authentication and base64 `image_url` messages; responses must contain a string at `choices[0].message.content`. APIs requiring the Responses API, `max_completion_tokens`, custom auth or other image formats need an adapter. Voice additionally needs multipart `/audio/transcriptions` returning `{"text": "..."}`. Request errors show fixed guidance without printing server response bodies or keys. Black/partial screenshots can still occur with protected windows or OS restrictions. Voice/device quality, real provider compatibility and OS permission prompts require checking on your machine. Linux/Windows are best-effort; local speech output is macOS-only.
+Compatibility targets the `/chat/completions` JSON schema with `max_tokens`, bearer authentication and base64 `image_url` messages; responses must contain a string at `choices[0].message.content`. APIs requiring the Responses API, `max_completion_tokens`, custom auth or other image formats need an adapter. Voice additionally needs multipart `/audio/transcriptions` returning `{"text": "..."}`. Request errors show fixed guidance without printing server response bodies or keys. Black/partial screenshots can still occur with protected windows or OS restrictions. Voice/device quality, real provider compatibility and OS permission prompts require checking on your machine. Linux/Windows are best-effort; speech playback there needs FFmpeg.
 
 ## Tests
 

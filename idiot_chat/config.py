@@ -1,4 +1,4 @@
-"""Configuration is read from the environment or held in memory, never saved."""
+"""API configuration stays in memory; only the non-secret voice preference is saved."""
 import os
 from dataclasses import dataclass, field
 from urllib.parse import urlsplit
@@ -50,3 +50,28 @@ class Config:
             )
         except (TypeError, ValueError) as error:
             raise ValueError('Invalid configuration: %s' % error) from None
+
+
+# Only the non-secret voice preference is persisted. API credentials remain in memory.
+def settings_path():
+    from pathlib import Path
+    return Path(os.environ.get('IDIOT_CHAT_SETTINGS', str(Path.home() / '.config/idiot-chat/settings.json')))
+
+
+def load_voice():
+    import json
+    from .voice import DEFAULT_VOICE
+    try:
+        value = json.loads(settings_path().read_text()).get('voice')
+        return value if isinstance(value, str) and value.strip() else DEFAULT_VOICE
+    except (OSError, ValueError, TypeError, AttributeError):
+        return DEFAULT_VOICE
+
+
+def save_voice(voice):
+    import json
+    path = settings_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix('.tmp')
+    temporary.write_text(json.dumps({'voice': voice}))
+    temporary.replace(path)

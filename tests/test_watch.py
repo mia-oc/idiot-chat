@@ -25,8 +25,12 @@ class WatchTests(unittest.TestCase):
         app.recorder.start.side_effect = lambda: setattr(app.recorder, 'active', True)
         app.recorder.cancel.side_effect = lambda: setattr(app.recorder, 'active', False)
         app.recorder.take.return_value = b'wav'
-        for name in ('speaker', 'status', 'capture_status', 'question', 'use_context', 'refresh', 'notice'):
+        for name in ('speaker', 'status', 'capture_status', 'question', 'use_context', 'refresh', 'notice', 'append', 'voice', 'speak_replies'):
             setattr(app, name, Mock())
+        app.voice.get.return_value = 'en-GB-SoniaNeural'
+        app.recorder.speech_started = __import__('threading').Event()
+        app.recorder.ready.return_value = False
+        app.speak = Mock()
         app.launch = lambda token, work: app.events.put(work())
         return app
 
@@ -39,7 +43,13 @@ class WatchTests(unittest.TestCase):
         app.watch_step()
         capture.assert_not_called()
         app.recorder.start.assert_not_called()
-        app.start()
+        with patch('idiot_chat.app.save_voice'):
+            app.start()
+        app.speak.assert_called_once_with('What do you need help with?')
+        capture.assert_not_called()
+        app.recorder.speech_started.set()
+        app.recorder.ready.return_value = True
+        app.watch_step()
         app.recorder.start.assert_called_once()
         client.return_value.transcribe.assert_called_once_with(b'wav')
         messages = client.return_value.chat.call_args.args[0]
@@ -70,7 +80,7 @@ class WatchTests(unittest.TestCase):
         app.busy = True
         app.watch_step()
         app.recorder.take.assert_not_called()
-        app.root.after.assert_called_once_with(5000, app.watch_step)
+        app.root.after.assert_called_once_with(60, app.watch_step)
 
     def test_live_audio_is_drained_bounded_and_silence_ignored(self):
         recorder = Recorder()
@@ -83,3 +93,61 @@ class WatchTests(unittest.TestCase):
         recorder.overflowed = True
         with self.assertRaises(VoiceError):
             recorder.take()
+
+
+class CancellationTests(unittest.TestCase):
+    make_app = WatchTests.make_app
+    def test_barge_in_invalidates_reply_and_stops_audio(self):
+        app = self.make_app()
+        old = app.session.start()
+        app.busy = True
+        app.recorder.active = True
+        app.recorder.speech_started.set()
+        app.watch_step()
+        self.assertTrue(old.is_set())
+        self.assertTrue(app.session.active)
+        self.assertFalse(app.busy)
+        app.speaker.stop.assert_called_once()
+
+    def test_late_response_cannot_clear_new_busy_or_speak(self):
+        app = self.make_app()
+        old = app.session.start()
+        app.interrupt()
+        app.busy = True
+        app.events.put(('done', old, ('chat', 'old', 'stale'), None))
+        app.poll()
+        self.assertTrue(app.busy)
+        self.assertEqual(app.history, [])
+        app.speak.assert_not_called()
+
+    def test_stop_releases_and_invalidates(self):
+        app = self.make_app()
+        old = app.session.start()
+        app.watch_after = 'timer'
+        app.stop()
+        self.assertTrue(old.is_set())
+        app.recorder.cancel.assert_called_once()
+        app.speaker.stop.assert_called_once()
+        self.assertIsNone(app.watch_after)
+
+    def test_tts_invocation_and_error_are_worker_events(self):
+        app = self.make_app()
+        app.session.start()
+        app.speaker.speak.side_effect = VoiceError('text fallback')
+        import threading
+        with patch('idiot_chat.app.threading.Thread') as thread:
+            thread.side_effect = lambda target, daemon: Mock(start=target)
+            App.speak(app, 'hello')
+        app.speaker.speak.assert_called_once_with('hello', 'en-GB-SoniaNeural', app.session.token())
+        self.assertEqual(app.events.get()[0], 'speech_error')
+
+    def test_voice_preference_persists_without_credentials(self):
+        import tempfile, os, json
+        from pathlib import Path
+        from idiot_chat.config import save_voice, load_voice
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'settings.json'
+            with patch.dict(os.environ, {'IDIOT_CHAT_SETTINGS': str(path)}):
+                save_voice('en-GB-RyanNeural')
+                self.assertEqual(load_voice(), 'en-GB-RyanNeural')
+                self.assertEqual(json.loads(path.read_text()), {'voice': 'en-GB-RyanNeural'})
