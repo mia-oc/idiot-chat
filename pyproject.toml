@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "idiot-chat"
+version = "0.1.0"
+description = "An explicit-session desktop assistant with on-demand screen context"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = ["Pillow>=10.4,<13"]
+
+[project.optional-dependencies]
+voice = ["sounddevice>=0.5,<0.6", "numpy>=1.24,<3"]
+
+[project.scripts]
+idiot-chat = "idiot_chat.app:main"
+
+[tool.setuptools.packages.find]
+include = ["idiot_chat*"]
